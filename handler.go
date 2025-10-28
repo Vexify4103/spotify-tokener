@@ -7,13 +7,34 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
 
+var (
+	cachedToken []byte
+	tokenExpiry time.Time
+	cacheMutex  sync.Mutex
+)
+
 func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+
+	// --- Cache check ---
+	cacheMutex.Lock()
+	if time.Now().Before(tokenExpiry) && cachedToken != nil {
+		slog.InfoContext(ctx, "Returning cached Spotify token")
+		cacheMutex.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(cachedToken)
+		return
+	}
+	cacheMutex.Unlock()
+	// -------------------
 
 	var cookies []*network.CookieParam
 	for _, cookie := range r.Cookies() {
@@ -32,6 +53,40 @@ func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to get access token payload", http.StatusInternalServerError)
 		return
 	}
+
+	expiry := time.Now().Add(55 * time.Minute) // fallback default
+	if strings.Contains(string(body), `"accessTokenExpirationTimestampMs"`) {
+		parts := strings.Split(string(body), `"accessTokenExpirationTimestampMs"`)
+		if len(parts) > 1 {
+			after := strings.SplitN(parts[1], ":", 2)
+			if len(after) > 1 {
+				numStr := ""
+				for _, ch := range after[1] {
+					if ch >= '0' && ch <= '9' {
+						numStr += string(ch)
+					} else if numStr != "" {
+						break
+					}
+				}
+				if numStr != "" {
+					ms, _ := time.ParseDuration(numStr + "ms")
+					abs := time.Unix(0, ms.Nanoseconds())
+					if abs.After(time.Now()) {
+						expiry = abs
+						slog.InfoContext(ctx, "Parsed Spotify token expiry", slog.Time("expiry", expiry))
+					}
+				}
+			}
+		}
+	}
+
+	// --- Cache store ---
+	cacheMutex.Lock()
+	cachedToken = body
+	tokenExpiry = expiry
+	cacheMutex.Unlock()
+	// -------------------
+
 
 	w.Header().Set("Content-Type", "application/json")
 	if _, err = w.Write(body); err != nil {
