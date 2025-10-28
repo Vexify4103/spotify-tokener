@@ -62,6 +62,8 @@ func main() {
 		},
 	}
 
+	s.startTokenRefresher()
+
 	mux.HandleFunc("/api/token", s.handleToken)
 
 	go s.Start()

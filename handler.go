@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -19,6 +20,11 @@ var (
 	tokenExpiry time.Time
 	cacheMutex  sync.Mutex
 )
+
+type spotifyTokenResponse struct {
+	AccessTokenExpirationMillis int64 `json:"accessTokenExpirationTimestampMs,string"`
+}
+
 
 func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -54,31 +60,8 @@ func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expiry := time.Now().Add(55 * time.Minute) // fallback default
-	if strings.Contains(string(body), `"accessTokenExpirationTimestampMs"`) {
-		parts := strings.Split(string(body), `"accessTokenExpirationTimestampMs"`)
-		if len(parts) > 1 {
-			after := strings.SplitN(parts[1], ":", 2)
-			if len(after) > 1 {
-				numStr := ""
-				for _, ch := range after[1] {
-					if ch >= '0' && ch <= '9' {
-						numStr += string(ch)
-					} else if numStr != "" {
-						break
-					}
-				}
-				if numStr != "" {
-					ms, _ := time.ParseDuration(numStr + "ms")
-					abs := time.Unix(0, ms.Nanoseconds())
-					if abs.After(time.Now()) {
-						expiry = abs
-						slog.InfoContext(ctx, "Parsed Spotify token expiry", slog.Time("expiry", expiry))
-					}
-				}
-			}
-		}
-	}
+	expiry := parseExpiry(body)
+	slog.InfoContext(ctx, "Parsed Spotify token expiry", slog.Time("expiry", expiry))
 
 	// --- Cache store ---
 	cacheMutex.Lock()
@@ -154,4 +137,53 @@ func (s *server) getAccessTokenPayload(rCtx context.Context, cookies []*network.
 	}
 
 	return body, nil
+}
+
+func (s *server) startTokenRefresher() {
+	go func() {
+		for {
+			cacheMutex.Lock()
+			expiry := tokenExpiry
+			cacheMutex.Unlock()
+
+			// refresh 1 min before expiry
+			sleepDuration := time.Until(expiry.Add(-1 * time.Minute))
+			if sleepDuration < 0 {
+				sleepDuration = 0
+			}
+
+			time.Sleep(sleepDuration)
+
+			slog.Info("Refreshing Spotify token in background")
+			body, err := s.getAccessTokenPayload(s.ctx, nil)
+			if err != nil {
+				slog.Error("Failed to refresh token, retrying in 30s", slog.Any("err", err))
+				time.Sleep(30 * time.Second)
+				continue
+			}
+
+			exp := parseExpiry(body)
+
+			cacheMutex.Lock()
+			cachedToken = body
+			tokenExpiry = exp
+			cacheMutex.Unlock()
+
+			slog.Info("Spotify token refreshed successfully", slog.Time("expiry", exp))
+		}
+	}()
+}
+
+func parseExpiry(body []byte) time.Time {
+	expiry := time.Now().Add(55 * time.Minute) // fallback default
+
+	var resp spotifyTokenResponse
+	if err := json.Unmarshal(body, &resp); err == nil && resp.AccessTokenExpirationMillis > 0 {
+		t := time.UnixMilli(resp.AccessTokenExpirationMillis)
+		if t.After(time.Now()) {
+			expiry = t
+		}
+	}
+
+	return expiry
 }
