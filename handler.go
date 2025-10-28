@@ -15,32 +15,23 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
+
+type cachedTokenEntry struct {
+	Token  []byte
+	Expiry time.Time
+}
+
 var (
-	cachedToken []byte
-	tokenExpiry time.Time
-	cacheMutex  sync.Mutex
+	tokenCache = make(map[string]cachedTokenEntry)
+	cacheMutex sync.Mutex
 )
 
 type spotifyTokenResponse struct {
 	AccessTokenExpirationMillis int64 `json:"accessTokenExpirationTimestampMs,string"`
 }
 
-
 func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-
-	// --- Cache check ---
-	cacheMutex.Lock()
-	if time.Now().Before(tokenExpiry) && cachedToken != nil {
-		slog.InfoContext(ctx, "Returning cached Spotify token")
-		cacheMutex.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(cachedToken)
-		return
-	}
-	cacheMutex.Unlock()
-	// -------------------
 
 	var cookies []*network.CookieParam
 	for _, cookie := range r.Cookies() {
@@ -50,6 +41,22 @@ func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 			URL:   spotifyURL,
 		})
 	}
+
+	key := cookiesKey(cookies)
+
+	// --- Cache check ---
+	cacheMutex.Lock()
+	entry, exists := tokenCache[key]
+	if exists && time.Now().Before(entry.Expiry) {
+		slog.InfoContext(ctx, "Returning cached Spotify token for key", slog.String("key", key))
+		cacheMutex.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(entry.Token)
+		return
+	}
+	cacheMutex.Unlock()
+	// -------------------
 
 	body, err := s.getAccessTokenPayload(ctx, cookies)
 	if err != nil {
@@ -65,11 +72,12 @@ func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
 
 	// --- Cache store ---
 	cacheMutex.Lock()
-	cachedToken = body
-	tokenExpiry = expiry
+	tokenCache[key] = cachedTokenEntry{
+		Token:  body,
+		Expiry: expiry,
+	}
 	cacheMutex.Unlock()
 	// -------------------
-
 
 	w.Header().Set("Content-Type", "application/json")
 	if _, err = w.Write(body); err != nil {
@@ -143,21 +151,24 @@ func (s *server) startTokenRefresher() {
 	go func() {
 		for {
 			cacheMutex.Lock()
-			expiry := tokenExpiry
+			entry, exists := tokenCache["anonymous"]
 			cacheMutex.Unlock()
 
-			// refresh 1 min before expiry
-			sleepDuration := time.Until(expiry.Add(-1 * time.Minute))
+			if !exists {
+				time.Sleep(10 * time.Second)
+				continue
+			}
+
+			sleepDuration := time.Until(entry.Expiry.Add(-1 * time.Minute))
 			if sleepDuration < 0 {
 				sleepDuration = 0
 			}
-
 			time.Sleep(sleepDuration)
 
-			slog.Info("Refreshing Spotify token in background")
-			body, err := s.getAccessTokenPayload(s.ctx, nil)
+			slog.Info("Refreshing anonymous Spotify token in background")
+			body, err := s.getAccessTokenPayload(s.ctx, nil) // no cookies for anonymous
 			if err != nil {
-				slog.Error("Failed to refresh token, retrying in 30s", slog.Any("err", err))
+				slog.Error("Failed to refresh anonymous token, retrying in 30s", slog.Any("err", err))
 				time.Sleep(30 * time.Second)
 				continue
 			}
@@ -165,14 +176,17 @@ func (s *server) startTokenRefresher() {
 			exp := parseExpiry(body)
 
 			cacheMutex.Lock()
-			cachedToken = body
-			tokenExpiry = exp
+			tokenCache["anonymous"] = cachedTokenEntry{
+				Token:  body,
+				Expiry: exp,
+			}
 			cacheMutex.Unlock()
 
-			slog.Info("Spotify token refreshed successfully", slog.Time("expiry", exp))
+			slog.Info("Anonymous Spotify token refreshed successfully", slog.Time("expiry", exp))
 		}
 	}()
 }
+
 
 func parseExpiry(body []byte) time.Time {
 	expiry := time.Now().Add(55 * time.Minute) // fallback default
@@ -186,4 +200,15 @@ func parseExpiry(body []byte) time.Time {
 	}
 
 	return expiry
+}
+
+func cookiesKey(cookies []*network.CookieParam) string {
+	if len(cookies) == 0 {
+		return "anonymous"
+	}
+	var parts []string
+	for _, c := range cookies {
+		parts = append(parts, c.Name+"="+c.Value)
+	}
+	return strings.Join(parts, ";")
 }
