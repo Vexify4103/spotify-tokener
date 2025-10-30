@@ -161,7 +161,7 @@ func (s *server) getAccessTokenPayload(rCtx context.Context, cookies []*network.
 }
 
 func (s *server) startAnonymousTokenRefresher() {
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	
 	for range ticker.C {
@@ -173,7 +173,7 @@ func (s *server) startAnonymousTokenRefresher() {
 			continue
 		}
 
-		if time.Until(entry.Expiry) > time.Minute {
+		if time.Until(entry.Expiry) > 100*time.Millisecond {
 			continue
 		}
 
