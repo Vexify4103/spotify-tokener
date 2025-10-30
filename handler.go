@@ -31,7 +31,7 @@ type server struct {
 }
 
 type spotifyTokenResponse struct {
-	AccessTokenExpirationTimestampMs int64 `json:"accessTokenExpirationTimestampMs,string"`
+	AccessTokenExpirationTimestampMs int64 `json:"accessTokenExpirationTimestampMs"`
 }
 
 func (s *server) handleToken(w http.ResponseWriter, r *http.Request) {
