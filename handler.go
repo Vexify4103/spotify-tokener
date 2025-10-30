@@ -161,6 +161,26 @@ func (s *server) getAccessTokenPayload(rCtx context.Context, cookies []*network.
 }
 
 func (s *server) startAnonymousTokenRefresher() {
+	slog.Info("Fetching initial anonymous Spotify token...")
+
+	body, err := s.getAccessTokenPayload(s.ctx, nil)
+	if err != nil {
+		slog.Error("Failed to fetch initial anonymous token", slog.Any("err", err))
+	} else {
+		exp, err := parseExpiry(body)
+		if err != nil {
+			slog.Error("Failed to parse initial anonymous token expiry", slog.Any("err", err))
+		} else {
+			s.cacheMutex.Lock()
+			s.tokenCache[""] = cachedTokenEntry{
+				Token:  body,
+				Expiry: exp,
+			}
+			s.cacheMutex.Unlock()
+			slog.Info("Initial anonymous Spotify token fetched successfully", slog.Time("expiry", exp))
+		}
+	}
+	
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	
